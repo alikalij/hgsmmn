@@ -221,3 +221,102 @@ class DiceLoss(nn.Module):
                 total_loss += dice_loss
         loss = total_loss / num_classes
         return self.loss_weight * loss
+
+
+@LOSSES.register_module()
+class BoundaryAwareLoss(nn.Module):
+    """
+    Boundary-Aware Cross-Entropy Loss for 3D Point Cloud Segmentation.
+    
+    This loss precisely identifies boundary points on-the-fly using highly 
+    optimized CUDA operations (pointops) and re-weights their cross-entropy penalty.
+    
+    A point is defined as a boundary if it has at least one valid k-nearest 
+    neighbor belonging to a different valid semantic class.
+    
+    Formula:
+        L = Mean(w_i * CE_i) 
+        where w_i = \lambda if point i is a boundary, else 1.0
+    """
+    
+    def __init__(
+        self,
+        k=8,                  # تعداد همسایه‌ها (K-NN)
+        boundary_weight=2.0,  # وزن مرزها (λ)
+        ignore_index=-1,
+        loss_weight=1.0,
+        enable_bal=True
+    ):
+        super(BoundaryAwareLoss, self).__init__()
+        self.k = k
+        self.boundary_weight = boundary_weight
+        self.ignore_index = ignore_index
+        self.loss_weight = loss_weight
+        self.enable_bal = enable_bal
+        
+        # محاسبه Loss به صورت نقطه به نقطه (reduction='none')
+        self.ce = nn.CrossEntropyLoss(reduction="none", ignore_index=ignore_index)
+
+    @torch.no_grad()
+    def compute_boundary_mask(self, target, coord, offset):
+        """
+        Dynamically computes the boundary mask using CUDA-accelerated KNN.
+        """
+        import pointops
+        
+        if target.numel() == 0 or not (target != self.ignore_index).any():
+            return torch.ones_like(target, dtype=torch.float32, device=target.device)
+    
+        # 1. پیدا کردن k همسایه نزدیک در کسری از میلی‌ثانیه با CUDA
+        # idx shape: (N, K)
+        idx, _ = pointops.knn_query(self.k, coord, coord, offset, offset)
+        idx = idx.long()
+        
+        # 2. استخراج لیبل همسایه‌ها
+        center_labels = target.unsqueeze(1)    # (N, 1)
+        neighbor_labels = target[idx]          # (N, K)
+        
+        # 3. فیلتر کردن نقاط ignore_index (برای جلوگیری از ایجاد نویز در مرزها)
+        valid_mask = (neighbor_labels != self.ignore_index) & (center_labels != self.ignore_index)
+        
+        # 4. نقطه‌ای مرزی است که همسایه‌اش لیبل متفاوتی داشته باشد و هر دو ولید باشند
+        diff_labels = (neighbor_labels != center_labels) & valid_mask
+        is_boundary = diff_labels.any(dim=1)   # (N,)
+        
+        # 5. ساخت ماسک وزن‌ها
+        weights = torch.ones_like(target, dtype=torch.float32)
+        weights[is_boundary] = self.boundary_weight
+        
+        return weights
+
+    def forward(self, pred, target, input_dict):
+        """
+        Args:
+            pred: (N, C) logits
+            target: (N,) ground-truth labels
+            input_dict: Dictionary containing 'coord' and 'offset' from Pointcept
+        """
+        valid_mask = target != self.ignore_index
+
+        # اگر هیچ نقطه‌ی معتبری وجود ندارد، loss صفر برگردان
+        if not valid_mask.any():
+            return pred.sum() * 0.0
+        
+        # 1. محاسبه خطای Cross-Entropy پایه برای تمام نقاط
+        ce_loss = self.ce(pred, target)  # (N,)
+        
+        # 2. بررسی فعال بودن BAL
+        if self.enable_bal and input_dict is not None and "coord" in input_dict and "offset" in input_dict:
+            # اعمال وزن مرزها فقط در صورت فعال بودن
+            coord = input_dict["coord"]
+            offset = input_dict["offset"]
+            boundary_weights = self.compute_boundary_mask(target, coord, offset)
+            loss_to_mean = ce_loss * boundary_weights
+        else:
+            # در صورت خاموش بودن، همان CE استاندارد استفاده می‌شود (وزن 1.0 برای همه)
+            loss_to_mean = ce_loss
+        
+        # 3. میانگین‌گیری نهایی فقط روی نقاط ولید
+        final_loss = loss_to_mean[valid_mask].mean()
+            
+        return final_loss * self.loss_weight

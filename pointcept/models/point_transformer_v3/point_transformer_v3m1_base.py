@@ -13,6 +13,8 @@ import torch.nn as nn
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
+import torch.nn.functional as F
+from pointcept.models.utils.structure import Point
 
 try:
     import flash_attn
@@ -24,6 +26,8 @@ from pointcept.models.builder import MODELS
 from pointcept.models.utils.misc import offset2bincount
 from pointcept.models.utils.structure import Point
 from pointcept.models.modules import PointModule, PointSequential
+
+import pointcept.models.point_transformer_v3.new_modules as modules
 
 
 class RPE(torch.nn.Module):
@@ -63,6 +67,14 @@ class SerializedAttention(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        enable_spe=False, 
+        spe_dim=None,
+        # GRAB parameters (NEW)
+        enable_grab=False,
+        grab_hidden_dim=32,
+        grab_use_distance=True,
+        grab_per_head=True,
+        grab_init_scale=0.01,
     ):
         super().__init__()
         assert channels % num_heads == 0
@@ -74,10 +86,15 @@ class SerializedAttention(PointModule):
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
         self.enable_flash = enable_flash
+        self.enable_grab = enable_grab  # NEW
         if enable_flash:
             assert (
                 enable_rpe is False
             ), "Set enable_rpe to False when enable Flash Attention"
+            # Original constraint: flash + RPE incompatible
+            # With GRAB: we relax this (GRAB handles bias differently)
+            if not enable_grab:
+                assert not enable_rpe, "flash attention does not support RPE without GRAB"
             assert (
                 upcast_attention is False
             ), "Set upcast_attention to False when enable Flash Attention"
@@ -95,11 +112,33 @@ class SerializedAttention(PointModule):
             self.patch_size = 0
             self.attn_drop = torch.nn.Dropout(attn_drop)
 
+        if enable_spe:
+            self.spe = modules.SerializationPositionalEncoding(
+                in_channels=spe_dim,
+                out_channels=spe_dim
+            )
+        else:
+            self.spe = None
+
         self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
         self.proj = torch.nn.Linear(channels, channels)
         self.proj_drop = torch.nn.Dropout(proj_drop)
+
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
+
+        # GRAB (NEW: geometric bias)
+        if enable_grab:
+            self.grab = modules.GeometryAwareRelativeAttentionBias(
+                num_heads=num_heads,
+                hidden_dim=grab_hidden_dim,
+                use_distance=grab_use_distance,
+                per_head=grab_per_head,
+                init_scale=grab_init_scale,
+            )
+            self._grab_flash_warned = False  # For one-time warning
+        else:
+            self.grab = None
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -183,9 +222,21 @@ class SerializedAttention(PointModule):
 
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
+        
+        # todo
+        # تزریق SPE قبل از qkv
+        # هر attention block می‌تواند SPE مستقل داشته باشد
+        # if self.spe is not None:
+        #     point.feat = self.spe(point.feat, point.serialized_order[self.order_index])
 
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
+
+        # ========== GRAB: Compute geometric bias (if enabled) ==========
+        grab_bias = None
+        if self.enable_grab:
+            rel_pos = self.get_rel_pos(point, order)  # (N', K, K, 3)
+            grab_bias = self.grab(rel_pos)  # (N', H, K, K)
 
         if not self.enable_flash:
             # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
@@ -199,20 +250,67 @@ class SerializedAttention(PointModule):
             attn = (q * self.scale) @ k.transpose(-2, -1)  # (N', H, K, K)
             if self.enable_rpe:
                 attn = attn + self.rpe(self.get_rel_pos(point, order))
+            
+            # Add GRAB bias (NEW)
+            if self.enable_grab:
+                attn = attn + grab_bias.to(attn.dtype)
+
             if self.upcast_softmax:
                 attn = attn.float()
             attn = self.softmax(attn)
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
+        # ========== Flash path with GRAB support ==========
         else:
-            feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.to(torch.bfloat16).reshape(-1, 3, H, C // H),
-                cu_seqlens,
-                max_seqlen=self.patch_size,
-                dropout_p=self.attn_drop if self.training else 0,
-                softmax_scale=self.scale,
-            ).reshape(-1, C)
-            feat = feat.to(qkv.dtype)
+            if self.enable_grab:
+                # Try flash_attn_func with attn_bias (requires unpacked q, k, v)
+                try:
+                    qkv_reshaped = qkv.reshape(-1, K, 3, H, C // H)
+                    q = qkv_reshaped[:, :, 0, :, :].contiguous()  # (N', K, H, C')
+                    k = qkv_reshaped[:, :, 1, :, :].contiguous()
+                    v = qkv_reshaped[:, :, 2, :, :].contiguous()
+                    
+                    # Call flash_attn_func with bias
+                    feat = flash_attn.flash_attn_func(
+                        q.to(torch.bfloat16),
+                        k.to(torch.bfloat16),
+                        v.to(torch.bfloat16),
+                        attn_bias=grab_bias.to(torch.bfloat16),
+                        dropout_p=self.attn_drop if self.training else 0,
+                        softmax_scale=self.scale,
+                    ).reshape(-1, C)
+                    feat = feat.to(qkv.dtype)
+                
+                except (TypeError, AttributeError) as e:
+                    # Fallback: flash_attn version doesn't support attn_bias
+                    if not self._grab_flash_warned:
+                        import warnings
+                        warnings.warn(
+                            f"flash_attn does not support attn_bias (error: {e}). "
+                            "Falling back to standard flash without GRAB bias. "
+                            "Consider upgrading flash-attn or using enable_flash=False."
+                        )
+                        self._grab_flash_warned = True
+                    
+                    # Use original flash path (no bias)
+                    feat = flash_attn.flash_attn_varlen_qkvpacked_func(
+                        qkv.to(torch.bfloat16).reshape(-1, 3, H, C // H),
+                        cu_seqlens,
+                        max_seqlen=self.patch_size,
+                        dropout_p=self.attn_drop if self.training else 0,
+                        softmax_scale=self.scale,
+                    ).reshape(-1, C)
+                    feat = feat.to(qkv.dtype)
+            else:
+                # Original flash path (no GRAB)
+                feat = flash_attn.flash_attn_varlen_qkvpacked_func(
+                    qkv.to(torch.bfloat16).reshape(-1, 3, H, C // H),
+                    cu_seqlens,
+                    max_seqlen=self.patch_size,
+                    dropout_p=self.attn_drop if self.training else 0,
+                    softmax_scale=self.scale,
+                ).reshape(-1, C)
+                feat = feat.to(qkv.dtype)
         feat = feat[inverse]
 
         # ffn
@@ -269,6 +367,14 @@ class Block(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        # GRAB parameters (NEW)
+        enable_grab=False,
+        grab_hidden_dim=32,
+        grab_use_distance=True,
+        grab_per_head=True,
+        grab_init_scale=0.01,
+        enable_gct=False,  
+        gct_num_anchors: int = 4,
     ):
         super().__init__()
         self.channels = channels
@@ -300,6 +406,12 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            # GRAB (NEW)
+            enable_grab=enable_grab,
+            grab_hidden_dim=grab_hidden_dim,
+            grab_use_distance=grab_use_distance,
+            grab_per_head=grab_per_head,
+            grab_init_scale=grab_init_scale,
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -314,6 +426,13 @@ class Block(PointModule):
         self.drop_path = PointSequential(
             DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
+                
+        self.enable_gct = enable_gct
+        if self.enable_gct:
+            self.gct = modules.GlobalContextToken(
+                channels=channels, 
+                num_anchors=gct_num_anchors
+            )
 
     def forward(self, point: Point):
         shortcut = point.feat
@@ -323,6 +442,10 @@ class Block(PointModule):
         if self.pre_norm:
             point = self.norm1(point)
         point = self.drop_path(self.attn(point))
+
+        if self.enable_gct:
+            point = self.gct(point)
+
         point.feat = shortcut + point.feat
         if not self.pre_norm:
             point = self.norm1(point)
@@ -349,6 +472,10 @@ class SerializedPooling(PointModule):
         reduce="max",
         shuffle_orders=True,
         traceable=True,  # record parent and cluster
+        # GTP Args
+        enable_gtp=False,
+        gtp_prune_ratio=0.25,
+        gtp_k=8,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -368,7 +495,37 @@ class SerializedPooling(PointModule):
         if act_layer is not None:
             self.act = PointSequential(act_layer())
 
+        # GTP Init
+        self.enable_gtp = enable_gtp
+        if self.enable_gtp:
+            self.gtp_pruner = modules.GeometryTokenPruner(prune_ratio=gtp_prune_ratio, k=gtp_k)
+
     def forward(self, point: Point):
+        # ---------- GTP Pruning ----------
+        if self.enable_gtp and self.training:
+            keep_mask, new_offset = self.gtp_pruner(point)
+            
+            # Update Point object
+            point.feat = point.feat[keep_mask]
+            point.coord = point.coord[keep_mask]
+            if point.grid_coord is not None:
+                point.grid_coord = point.grid_coord[keep_mask]
+            
+            # Keep serialized_code for clustering but filter it
+            if point.serialized_code is not None:
+                point.serialized_code = point.serialized_code[:, keep_mask]
+                
+            point.offset = new_offset
+            
+            if point.batch is not None:
+                point.batch = point.batch[keep_mask]
+                
+            # INVALIATE old order and inverse! 
+            # They will be regenerated by the pooling logic or downstream layers
+            point.serialized_order = None
+            point.serialized_inverse = None
+        # ---------------------------------
+
         pooling_depth = (math.ceil(self.stride) - 1).bit_length()
         if pooling_depth > point.serialized_depth:
             pooling_depth = 0
@@ -453,6 +610,7 @@ class SerializedUnpooling(PointModule):
         norm_layer=None,
         act_layer=None,
         traceable=False,  # record parent and cluster
+        enable_gsc=False,       # ✅ ablation flag
     ):
         super().__init__()
         self.proj = PointSequential(nn.Linear(in_channels, out_channels))
@@ -467,6 +625,16 @@ class SerializedUnpooling(PointModule):
             self.proj_skip.add(act_layer())
 
         self.traceable = traceable
+        
+        self.enable_gsc = enable_gsc
+
+        # GSC operates on projected features → both are out_channels
+        if self.enable_gsc:
+            self.gsc = modules.GatedSkipConnectionCL(enc_channels=out_channels, dec_channels=out_channels)
+
+        # ✅ راه‌اندازی GSC با کانال‌های خروجی (زیرا proj و proj_skip قبلا ابعاد را همسان کرده‌اند)
+        # if self.enable_gsc:
+        #     self.gsc = modules.GatedSkipConnectionGE(encoder_channels=out_channels, decoder_channels=out_channels)
 
     def forward(self, point):
         assert "pooling_parent" in point.keys()
@@ -475,8 +643,19 @@ class SerializedUnpooling(PointModule):
         inverse = point.pop("pooling_inverse")
         point = self.proj(point)
         parent = self.proj_skip(parent)
-        parent.feat = parent.feat + point.feat[inverse]
-
+        
+        # Upsample decoder features to encoder resolution
+        decoder_feat_upsampled = point.feat[inverse]
+        
+        # ✅ اعمال ترکیب هوشمند GSC یا جمع ساده کلاسیک
+        if self.enable_gsc:
+            # Gate: blend encoder skip with upsampled decoder
+            parent.feat = self.gsc(parent.feat, decoder_feat_upsampled)
+        else:
+            # Baseline: simple addition
+            parent.feat = parent.feat + decoder_feat_upsampled
+        #parent.feat = parent.feat + point.feat[inverse]
+        
         if self.traceable:
             parent["unpooling_parent"] = point
         return parent
@@ -549,13 +728,34 @@ class PointTransformerV3(PointModule):
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+
+        enable_spe=False,  # ✅ پارامتر جدید
+        spe_dim=32,
+        enable_gsc=False,
+        
+        # GRAB parameters (NEW)
+        enable_grab=False,
+        grab_hidden_dim=32,
+        grab_use_distance=True,
+        grab_per_head=True,
+        grab_init_scale=0.01,
+
+        # --- پارامترهای GTP اضافه شده ---
+        enable_gtp=False,
+        gtp_prune_ratio=0.0,
+        gtp_k=8,
+        # --------------------------------
+        enable_gct: bool = False,      
+        gct_num_anchors: int = 4,      
+        **kwargs,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.enc_mode = enc_mode
         self.shuffle_orders = shuffle_orders
-
+        self.enable_gct = enable_gct
+        
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
         assert self.num_stages == len(enc_channels)
@@ -599,6 +799,17 @@ class PointTransformerV3(PointModule):
             act_layer=act_layer,
         )
 
+        if enable_spe:
+            # به جای یک SPE، برای هر stage یک SPE بسازید
+            self.spe_modules = nn.ModuleList([
+                modules.SerializationPositionalEncoding(
+                    channels=enc_channels[s],
+                    hidden_dim=spe_dim
+                ) for s in range(len(enc_depths))
+            ])
+        else:
+            self.spe_modules = None
+        
         # encoder
         enc_drop_path = [
             x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))
@@ -610,6 +821,13 @@ class PointTransformerV3(PointModule):
             ]
             enc = PointSequential()
             if s > 0:
+                # --- کدهای جدید برای محاسبه ضریب هرس هر لایه ---
+                # چون 4 لایه pooling داریم (s از 1 تا 4)، ایندکس s-1 می‌شود 0 تا 3
+                if isinstance(gtp_prune_ratio, (list, tuple)):
+                    current_prune_ratio = gtp_prune_ratio[s - 1]
+                else:
+                    current_prune_ratio = gtp_prune_ratio
+                # -----------------------------------------------
                 enc.add(
                     SerializedPooling(
                         in_channels=enc_channels[s - 1],
@@ -617,9 +835,24 @@ class PointTransformerV3(PointModule):
                         stride=stride[s - 1],
                         norm_layer=bn_layer,
                         act_layer=act_layer,
+                        # ==========================================
+                        # پارامترهای GTP که در کد شما جا افتاده بود:
+                        enable_gtp=enable_gtp,
+                        gtp_prune_ratio=current_prune_ratio,
+                        gtp_k=gtp_k
+                        # ==========================================
                     ),
                     name="down",
                 )
+
+            # todo
+            # 🔥 اضافه کردن SPE wrapper در ابتدای هر stage
+            # if enable_spe:
+            #     enc.add(
+            #         modules.SPEStageWrapper(self.spe_modules[s], stage_idx=s),
+            #         name=f"spe_stage{s}"
+            #     )
+
             for i in range(enc_depths[s]):
                 enc.add(
                     Block(
@@ -641,6 +874,14 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        # GRAB (NEW)
+                        enable_grab=enable_grab,
+                        grab_hidden_dim=grab_hidden_dim,
+                        grab_use_distance=grab_use_distance,
+                        grab_per_head=grab_per_head,
+                        grab_init_scale=grab_init_scale,
+                        enable_gct=enable_gct,           
+                        gct_num_anchors=gct_num_anchors
                     ),
                     name=f"block{i}",
                 )
@@ -667,6 +908,7 @@ class PointTransformerV3(PointModule):
                         out_channels=dec_channels[s],
                         norm_layer=bn_layer,
                         act_layer=act_layer,
+                        enable_gsc=enable_gsc,
                     ),
                     name="up",
                 )
@@ -696,12 +938,37 @@ class PointTransformerV3(PointModule):
                     )
                 self.dec.add(module=dec, name=f"dec{s}")
 
+        self.enable_spe = enable_spe
+        # ✅ ساخت ماژول SPE
+        if self.enable_spe:
+            self.spe = modules.SerializationPositionalEncoding(
+                channels=enc_channels[0],  # 32
+                hidden_dim=spe_dim
+            )
+
     def forward(self, data_dict):
         point = Point(data_dict)
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
         point = self.embedding(point)
+
+        # ✅ تزریق SPE دقیقاً اینجا
+        # SPE فقط یکبار قبل از encoder اعمال می‌شود
+        # در decoder و attention blocks بعدی تکرار نمی‌شود
+        # اگر shuffle_orders فعال باشد، ترتیب در هر block تغییر می‌کند ولی SPE ثابت می‌ماند
+        if self.enable_spe:
+            # point.serialized_order is populated by point.serialization()
+            if hasattr(point, 'serialized_order') and len(point.serialized_order) > 0:
+                # استفاده از اولین order (z-order)
+                serialized_order = point.serialized_order[0]
+                #point.feat = self.spe(point.feat, serialized_order)
+            else:
+                # Fallback if no order is found
+                serialized_order = torch.arange(point.feat.shape[0], device=point.feat.device)
+                #point.feat = self.spe(serialized_order, point.feat)
+            point.feat = self.spe(point.feat, serialized_order)
+
         point = self.enc(point)
         if not self.enc_mode:
             point = self.dec(point)

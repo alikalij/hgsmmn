@@ -44,10 +44,33 @@ model = dict(
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+
+        # --- [SPE Added] ---
+        enable_spe=True,     # فعال کردن ماژول SPE
+        spe_dim=32,          # ابعاد لایه پنهان در MLP
+        enable_gsc=True,
+        # ========== GRAB Configuration (NEW) ==========
+        enable_grab=True,
+        grab_hidden_dim=32,        # Optimized for 8GB VRAM
+        grab_use_distance=True,    # Use [dx, dy, dz, dist]
+        grab_per_head=True,        # Per-head bias (more expressive)
+        grab_init_scale=0.01,      # Small initial scale for stability
+        # ==========================================
+        # پارامترهای جدید GTP که باید اینجا اضافه کنید:
+        # ==========================================
+        enable_gtp=True,
+        # می‌توانید یک عدد ثابت (مثل 0.25) بدهید یا برای هر لایه Pooling یک مقدار جداگانه (مثل لیست زیر)
+        gtp_prune_ratio=[0.1, 0.2, 0.3, 0.4], 
+        gtp_k=8,
+        # ==========================================
+        # ---> تنظیمات اضافه شده برای Ablation Study <---
+        enable_gct=True,         # برای تست Base (بدون ماژول) این را False کنید
+        gct_num_anchors=4,       # تنظیم تعداد لنگرهای معنایی (تست مقادیر 2, 4, 8)
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+        dict(type='BoundaryAwareLoss', k=8, boundary_weight=2.0, ignore_index=-1, loss_weight=1.0, enable_bal=False), 
     ],
 )
 

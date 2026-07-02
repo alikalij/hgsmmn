@@ -82,11 +82,11 @@ class DefaultSegmentorV2(nn.Module):
             return_dict["point"] = point
         # train
         if self.training:
-            loss = self.criteria(seg_logits, input_dict["segment"])
+            loss = self.criteria(seg_logits, input_dict["segment"], input_dict=input_dict) # پاس دادن input_dict
             return_dict["loss"] = loss
         # eval
         elif "segment" in input_dict.keys():
-            loss = self.criteria(seg_logits, input_dict["segment"])
+            loss = self.criteria(seg_logits, input_dict["segment"], input_dict=input_dict) # پاس دادن input_dict
             return_dict["loss"] = loss
             return_dict["seg_logits"] = seg_logits
         # test
