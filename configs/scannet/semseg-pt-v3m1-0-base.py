@@ -34,7 +34,7 @@ model = dict(
         shuffle_orders=True,
         pre_norm=True,
         enable_rpe=False,
-        enable_flash=False,
+        enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
         enc_mode=False,
@@ -50,7 +50,7 @@ model = dict(
         spe_dim=32,          # ابعاد لایه پنهان در MLP
         enable_gsc=True,
         # ========== GRAB Configuration (NEW) ==========
-        enable_grab=True,
+        enable_grab=False,
         grab_hidden_dim=32,        # Optimized for 8GB VRAM
         grab_use_distance=False,    # Use [dx, dy, dz, dist]
         grab_per_head=False,        # Per-head bias (more expressive)
@@ -58,7 +58,7 @@ model = dict(
         # ==========================================
         # پارامترهای جدید GTP که باید اینجا اضافه کنید:
         # ==========================================
-        enable_gtp=False,
+        enable_gtp=True,
         # می‌توانید یک عدد ثابت (مثل 0.25) بدهید یا برای هر لایه Pooling یک مقدار جداگانه (مثل لیست زیر)
         gtp_prune_ratio=[0.1, 0.2, 0.3, 0.4], 
         gtp_k=8,
