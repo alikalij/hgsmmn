@@ -48,23 +48,23 @@ model = dict(
         # --- [SPE Added] ---
         enable_spe=True,     # فعال کردن ماژول SPE
         spe_dim=32,          # ابعاد لایه پنهان در MLP
-        enable_gsc=True,
+        enable_gsc=False,
         # ========== GRAB Configuration (NEW) ==========
-        enable_grab=True,
+        enable_grab=False,
         grab_hidden_dim=32,        # Optimized for 8GB VRAM
-        grab_use_distance=True,    # Use [dx, dy, dz, dist]
-        grab_per_head=True,        # Per-head bias (more expressive)
+        grab_use_distance=False,    # Use [dx, dy, dz, dist]
+        grab_per_head=False,        # Per-head bias (more expressive)
         grab_init_scale=0.01,      # Small initial scale for stability
         # ==========================================
         # پارامترهای جدید GTP که باید اینجا اضافه کنید:
         # ==========================================
-        enable_gtp=True,
+        enable_gtp=False,
         # می‌توانید یک عدد ثابت (مثل 0.25) بدهید یا برای هر لایه Pooling یک مقدار جداگانه (مثل لیست زیر)
         gtp_prune_ratio=[0.1, 0.2, 0.3, 0.4], 
         gtp_k=8,
         # ==========================================
         # ---> تنظیمات اضافه شده برای Ablation Study <---
-        enable_gct=True,         # برای تست Base (بدون ماژول) این را False کنید
+        enable_gct=False,         # برای تست Base (بدون ماژول) این را False کنید
         gct_num_anchors=4,       # تنظیم تعداد لنگرهای معنایی (تست مقادیر 2, 4, 8)
     ),
     criteria=[
