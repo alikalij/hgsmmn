@@ -64,7 +64,7 @@ model = dict(
         gtp_k=8,
         # ==========================================
         # ---> تنظیمات اضافه شده برای Ablation Study <---
-        enable_gct=False,         # برای تست Base (بدون ماژول) این را False کنید
+        enable_gct=True,         # برای تست Base (بدون ماژول) این را False کنید
         gct_num_anchors=4,       # تنظیم تعداد لنگرهای معنایی (تست مقادیر 2, 4, 8)
     ),
     criteria=[
