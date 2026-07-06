@@ -50,7 +50,7 @@ model = dict(
         spe_dim=32,          # ابعاد لایه پنهان در MLP
         enable_gsc=True,
         # ========== GRAB Configuration (NEW) ==========
-        enable_grab=False,
+        enable_grab=True,
         grab_hidden_dim=32,        # Optimized for 8GB VRAM
         grab_use_distance=False,    # Use [dx, dy, dz, dist]
         grab_per_head=False,        # Per-head bias (more expressive)
