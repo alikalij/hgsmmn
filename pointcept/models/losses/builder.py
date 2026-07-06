@@ -5,6 +5,7 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
+import inspect
 from pointcept.utils.registry import Registry
 
 LOSSES = Registry("losses")
@@ -23,8 +24,13 @@ class Criteria(object):
             return pred
         loss = 0
         for c in self.criteria:
-            loss += c(pred, target, **kwargs)  # <-- اضافه کردن kwargs
-            #loss += c(pred, target)
+            sig = inspect.signature(c.forward)
+        
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if 'input_dict' in sig.parameters or accepts_kwargs:
+                loss += c(pred, target, **kwargs)
+            else:
+                loss += c(pred, target)
         return loss
 
 
