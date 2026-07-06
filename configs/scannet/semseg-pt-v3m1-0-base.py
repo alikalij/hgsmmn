@@ -48,7 +48,7 @@ model = dict(
         # --- [SPE Added] ---
         enable_spe=True,     # فعال کردن ماژول SPE
         spe_dim=32,          # ابعاد لایه پنهان در MLP
-        enable_gsc=False,
+        enable_gsc=True,
         # ========== GRAB Configuration (NEW) ==========
         enable_grab=False,
         grab_hidden_dim=32,        # Optimized for 8GB VRAM
