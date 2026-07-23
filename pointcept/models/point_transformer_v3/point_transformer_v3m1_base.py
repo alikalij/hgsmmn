@@ -568,6 +568,45 @@ class SerializedPooling(PointModule):
             order = order[perm]
             inverse = inverse[perm]
 
+        #===================================================
+        # بعد از ساخت idx_ptr و indices، قبل از segment_csr
+        N = point.feat.shape[0]
+        assert cluster.numel() == N, f"cluster.numel={cluster.numel()} != N={N}"
+        assert indices.max().item() < N, f"indices.max={indices.max().item()} >= N={N}"
+        assert idx_ptr[-1].item() == N, f"idx_ptr[-1]={idx_ptr[-1].item()} != N={N}"
+        assert cluster.max().item() < len(counts), f"cluster.max={cluster.max().item()} >= num_clusters={len(counts)}"
+        #====================================================================
+        if indices.numel() == 0:
+            raise RuntimeError(
+                f"SerializedPooling got empty indices: "
+                f"feat_shape={tuple(point.feat.shape)}, "
+                f"code_shape={tuple(code.shape)}, "
+                f"idx_ptr_shape={tuple(idx_ptr.shape)}"
+            )
+
+        assert idx_ptr[-1].item() == indices.numel(), (
+            f"idx_ptr[-1]={idx_ptr[-1].item()} != len(indices)={indices.numel()}, "
+            f"counts_sum={counts.sum().item()}, "
+            f"num_clusters={counts.numel()}"
+        )
+
+        assert indices.min().item() >= 0, (
+            f"indices.min={indices.min().item()} < 0"
+        )
+
+        assert indices.max().item() < point.feat.shape[0], (
+            f"indices.max={indices.max().item()} >= feat.shape[0]={point.feat.shape[0]}"
+        )
+
+        assert cluster.min().item() >= 0, (
+            f"cluster.min={cluster.min().item()} < 0"
+        )
+
+        assert cluster.max().item() < counts.numel(), (
+            f"cluster.max={cluster.max().item()} >= num_clusters={counts.numel()}"
+        )
+        #==========================================
+
         # collect information
         point_dict = Dict(
             feat=torch_scatter.segment_csr(
